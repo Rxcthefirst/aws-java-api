@@ -1,5 +1,6 @@
 package com.rxcthefirst.aws.service;
 
+import io.swagger.v3.core.util.Json;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -9,23 +10,38 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.*;
 
 
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 @Service
 public class S3Service {
 
     private final S3Client s3Client;
 
+    private final JsonFileReader jsonFileReader;
+
     // Name of your S3 bucket
     private final String bucketName = "rxcthefirst-testdata";
 
     @Autowired
-    public S3Service(S3Client s3Client) {
+    public S3Service(S3Client s3Client, JsonFileReader jsonFileReader) {
         this.s3Client = s3Client;
+        this.jsonFileReader = jsonFileReader;
     }
 
     // Upload a file to S3
@@ -123,5 +139,150 @@ public class S3Service {
                 .collect(Collectors.toList());
     }
 
+    public void uploadFolder(String bucketName, String folderPath, String s3Prefix) {
+        File folder = new File(folderPath);
+        if (!folder.isDirectory()) {
+            throw new IllegalArgumentException("The provided path is not a directory: " + folderPath);
+        }
+
+        // Create a thread pool
+        ExecutorService executorService = Executors.newFixedThreadPool(64); // Adjust thread count as needed
+
+        try {
+            for (File file : Objects.requireNonNull(folder.listFiles())) {
+                if (file.isFile()) {
+                    executorService.submit(() -> uploadFile(bucketName, file, s3Prefix));
+                } else if (file.isDirectory()) {
+                    // Recursively upload subfolders
+                    uploadFolder(bucketName, file.getAbsolutePath(), s3Prefix + "/" + file.getName());
+                }
+            }
+        } finally {
+            executorService.shutdown();
+            try {
+                executorService.awaitTermination(1, TimeUnit.HOURS); // Adjust timeout as needed
+            } catch (InterruptedException e) {
+                throw new RuntimeException("File upload process was interrupted", e);
+            }
+        }
+    }
+
+    private void uploadFile(String bucketName, File file, String s3Prefix) {
+        String s3Key = s3Prefix + "/" + file.getName();
+        try {
+            s3Client.putObject(
+                    PutObjectRequest.builder()
+                            .bucket(bucketName)
+                            .key(s3Key)
+                            .build(),
+                    file.toPath()
+            );
+            System.out.println("Uploaded: " + file.getName() + " to S3 key: " + s3Key);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to upload file: " + file.getName(), e);
+        }
+    }
+
+    public void uploadZipFileToS3(MultipartFile zipFile, String bucketName, String s3Prefix) throws Exception {
+        // Create temporary directory to extract files
+        Path tempDir = Files.createTempDirectory("unzipped");
+
+        try (InputStream is = zipFile.getInputStream();
+             ZipInputStream zis = new ZipInputStream(is)) {
+
+            // Extract files from ZIP
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (!entry.isDirectory()) {
+                    Path filePath = tempDir.resolve(entry.getName());
+                    Files.createDirectories(filePath.getParent()); // Ensure parent directories exist
+                    Files.copy(zis, filePath, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+
+        // Upload extracted files to S3 in parallel
+        uploadFolderToS3Parallel(tempDir, bucketName, s3Prefix);
+
+        // Clean up temporary directory
+        deleteTempDir(tempDir);
+    }
+
+    private void uploadFolderToS3Parallel(Path folderPath, String bucketName, String s3Prefix) {
+        ExecutorService executorService = Executors.newFixedThreadPool(10); // Adjust thread count as needed
+        try {
+            Files.walk(folderPath).filter(Files::isRegularFile).forEach(file -> {
+                executorService.submit(() -> {
+                    String s3Key = s3Prefix + "/" + folderPath.relativize(file).toString();
+                    try {
+                        s3Client.putObject(
+                                PutObjectRequest.builder()
+                                        .bucket(bucketName)
+                                        .key(s3Key)
+                                        .build(),
+                                file
+                        );
+                        System.out.println("Uploaded: " + file + " to S3 key: " + s3Key);
+                    } catch (Exception e) {
+                        System.err.println("Failed to upload file: " + file + " due to " + e.getMessage());
+                    }
+                });
+            });
+        } catch (Exception e) {
+            throw new RuntimeException("Error uploading files to S3", e);
+        } finally {
+            executorService.shutdown();
+        }
+    }
+    public void uploadFilesParallel(List<Path> files, String bucketName, String s3Prefix) {
+        ExecutorService executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+
+        try {
+            List<? extends Future<?>> futures = files.stream()
+                    .map(file -> executorService.submit(() -> uploadFile(file, bucketName, s3Prefix)))
+                    .toList();
+
+            // Wait for all uploads to complete
+            for (Future<?> future : futures) {
+                future.get();
+            }
+
+            System.out.println("All files uploaded successfully!");
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to upload files to S3", e);
+        } finally {
+            executorService.shutdown();
+        }
+    }
+
+    private void uploadFile(Path file, String bucketName, String s3Prefix) {
+        String key = s3Prefix + "/" + file.getFileName().toString();
+        try {
+            s3Client.putObject(
+                    PutObjectRequest.builder()
+                            .bucket(bucketName)
+                            .key(key)
+                            .build(),
+                    file
+            );
+            System.out.println("Uploaded: " + file + " to S3 as " + key);
+        } catch (Exception e) {
+            System.err.println("Failed to upload file: " + file + " due to " + e.getMessage());
+        }
+    }
+
+    private void deleteTempDir(Path tempDir) {
+        try {
+            Files.walk(tempDir)
+                    .map(Path::toFile)
+                    .forEach(file -> {
+                        if (!file.delete()) {
+                            System.err.println("Failed to delete: " + file);
+                        }
+                    });
+        } catch (Exception e) {
+            System.err.println("Failed to clean up temporary directory: " + e.getMessage());
+        }
+    }
 
 }
