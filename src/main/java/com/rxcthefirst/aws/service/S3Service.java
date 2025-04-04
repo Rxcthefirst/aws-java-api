@@ -1,5 +1,6 @@
 package com.rxcthefirst.aws.service;
 
+import com.rxcthefirst.aws.dto.S3FileMetadata;
 import io.swagger.v3.core.util.Json;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -17,9 +18,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.List;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.concurrent.ExecutorService;
@@ -285,4 +284,71 @@ public class S3Service {
         }
     }
 
+    public void uploadFile(String key, String author, List<String> sharedWith, String jsonBody) {
+        List<Tag> tags = new ArrayList<>();
+        tags.add(Tag.builder().key("author").value(author).build());
+
+        if (sharedWith != null && !sharedWith.isEmpty()) {
+            String sharedStr = String.join(",", sharedWith);
+            tags.add(Tag.builder().key("sharedWith").value(sharedStr).build());
+        }
+
+        PutObjectRequest putRequest = PutObjectRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .contentType("application/json")
+                .build();
+
+        s3Client.putObject(putRequest, RequestBody.fromString(jsonBody));
+
+        s3Client.putObjectTagging(PutObjectTaggingRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .tagging(Tagging.builder().tagSet(tags).build())
+                .build());
+    }
+
+    public List<S3FileMetadata> listFilesWithTagging(String username) {
+        ListObjectsV2Response listResponse = s3Client.listObjectsV2(ListObjectsV2Request.builder()
+                .bucket(bucketName)
+                .prefix("tagged_files/")
+                .build());
+
+        List<S3FileMetadata> result = new ArrayList<>();
+
+        for (S3Object object : listResponse.contents()) {
+            String key = object.key();
+            String author = null;
+            String sharedWith = null;
+
+            try {
+                GetObjectTaggingResponse tagResponse = s3Client.getObjectTagging(GetObjectTaggingRequest.builder()
+                        .bucket(bucketName)
+                        .key(key)
+                        .build());
+
+                for (Tag tag : tagResponse.tagSet()) {
+                    if ("author".equalsIgnoreCase(tag.key())) {
+                        author = tag.value();
+                    } else if ("sharedWith".equalsIgnoreCase(tag.key())) {
+                        sharedWith = tag.value();
+                    }
+                }
+
+                if (username == null ||
+                        username.equals(author) ||
+                        (sharedWith != null && Arrays.asList(sharedWith.split("_")).contains(username))) {
+
+                    result.add(new S3FileMetadata(key, author, sharedWith));
+                }
+
+            } catch (S3Exception e) {
+                // Skip object if tagging fails
+                System.err.println("Failed to get tags for object " + key + ": " + e.awsErrorDetails().errorMessage());
+            }
+        }
+
+        return result;
+    }
 }
+
