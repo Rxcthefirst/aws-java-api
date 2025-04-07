@@ -286,8 +286,10 @@ public class S3Service {
 
     public void uploadFile(String key, String author, List<String> sharedWith, String jsonBody) {
         List<Tag> tags = new ArrayList<>();
+        String prefix = "tagged_files/";
         tags.add(Tag.builder().key("author").value(author).build());
 
+        key = prefix + key;
         if (sharedWith != null && !sharedWith.isEmpty()) {
             String sharedStr = String.join(",", sharedWith);
             tags.add(Tag.builder().key("sharedWith").value(sharedStr).build());
@@ -339,7 +341,14 @@ public class S3Service {
                         username.equals(author) ||
                         (sharedWith != null && Arrays.asList(sharedWith.split("_")).contains(username))) {
 
-                    result.add(new S3FileMetadata(key, author, sharedWith));
+                    result.add(new S3FileMetadata(
+                            key,
+                            author,
+                            sharedWith,
+                            object.size(),
+                            object.lastModified().toString(),
+                            object.eTag()
+                    ));
                 }
 
             } catch (S3Exception e) {
